@@ -1,0 +1,32 @@
+# Rust build artifacts
+/target
+**/target
+Cargo.lock
+
+# Environment configuration
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Android build artifacts
+*.so
+*.dylib
+*.dll
+
+# SQLite
+db.sqlite
+
+
+# bls filecoin files
+circuits/src/assets/*

@@ -1,0 +1,14 @@
+[package]
+name = "circuits"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+hex-literal = { workspace = true }
+midnight-zk-stdlib = { workspace = true }
+midnight-circuits = { workspace = true }
+midnight-curves = { workspace = true }
+midnight-proofs = { workspace = true }
+num-bigint = { workspace = true }
+sha2 = { version = "0.10", features = ["oid"] }
+rsa = "0.9.10"

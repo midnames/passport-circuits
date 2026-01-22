@@ -1,0 +1,19 @@
+[workspace]
+members = ["circuits", "server", "generator"]
+resolver = "2"
+
+[workspace.dependencies]
+midnight-zk-stdlib = { version = "1.0.0" }
+midnight-circuits = { version = "6.0.0" }
+midnight-curves = { version = "0.2.0" }
+midnight-proofs = { version = "0.7.0", default-features = false, features = ["circuit-params", "committed-instances"] }
+hex-literal = "1.1.0"
+num-bigint = "0.4.6"
+hex = "0.4.3"
+
+
+[patch.crates-io]
+midnight-zk-stdlib = { git = "https://github.com/midnames/midnight-zk.git", branch = "main" }
+midnight-circuits = { git = "https://github.com/midnames/midnight-zk.git", branch = "main" }
+midnight-curves = { git = "https://github.com/midnames/midnight-zk.git", branch = "main" }
+midnight-proofs = { git = "https://github.com/midnames/midnight-zk.git", branch = "main" }
