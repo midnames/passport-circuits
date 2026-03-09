@@ -5,3 +5,6 @@
   - The passport ones are the ones used for testing using `cargo run -p generator`
 
 - Main circuit is `circuits/src/passport.rs`
+
+
+This project is built on the Midnight Network.
