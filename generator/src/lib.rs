@@ -6,30 +6,68 @@ use jni::errors::Error as JniError;
 use jni::{
     JNIEnv,
     objects::{JByteArray, JClass, JString},
-    sys::{jint, jsize, jstring},
+    sys::{jint, jstring},
 };
 use num_bigint::BigUint;
 use rand::rngs::OsRng;
+
+const STACK_SIZE: usize = 64 * 1024 * 1024; // 64 MB
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_midnames_passportreader_zk_ZkProofManager_generateProof<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
-    ml_c: jsize,
-    ml_bytes: JByteArray<'local>,
+    pubkey_mod: JByteArray<'local>,
+    pubkey_exp: JByteArray<'local>,
     pnum_hash: JByteArray<'local>,
     todays_date: JString<'local>,
     efsod: JByteArray<'local>,
     dg1: JByteArray<'local>,
 ) -> jstring {
-    match generate_proof(&mut env, ml_c, ml_bytes, pnum_hash, todays_date, efsod, dg1) {
-        Ok(result) => result,
+    // Read all JNI inputs before spawning — env cannot cross thread boundaries
+    let inputs = (|| -> Result<_, Box<dyn std::error::Error>> {
+        let mod_bytes = read_jbytearray_as_vec(&env, &pubkey_mod)?;
+        let exp_bytes = read_jbytearray_as_vec(&env, &pubkey_exp)?;
+        let pnum_hash = read_jbytearray_as_array::<LEN_PNUM_HASH>(&env, &pnum_hash)?;
+        let todays_date = read_jstring_as_array::<LEN_DATE>(&mut env, todays_date)?;
+        let efsod = read_jbytearray_as_vec(&env, &efsod)?;
+        let dg1 = read_jbytearray_as_array::<LEN_DG1>(&env, &dg1)?;
+        Ok((mod_bytes, exp_bytes, pnum_hash, todays_date, efsod, dg1))
+    })();
+
+    let result: Result<String, Box<dyn std::error::Error>> =
+        inputs.and_then(|(mod_bytes, exp_bytes, pnum_hash, todays_date, efsod, dg1)| {
+            std::thread::Builder::new()
+                .stack_size(STACK_SIZE)
+                .spawn(move || generate_proof(mod_bytes, exp_bytes, pnum_hash, todays_date, efsod, dg1))
+                .map_err(|e| -> Box<dyn std::error::Error> { format!("thread spawn failed: {e}").into() })
+                .and_then(|h| h.join().map_err(|e| -> Box<dyn std::error::Error> {
+                    let msg = if let Some(s) = e.downcast_ref::<&str>() {
+                        s.to_string()
+                    } else if let Some(s) = e.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "proof thread panicked (unknown cause)".to_string()
+                    };
+                    msg.into()
+                }))
+                .and_then(|r| r.map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() }))
+        });
+
+    match result {
+        Ok(json) => match env.new_string(json) {
+            Ok(s) => s.into_raw(),
+            Err(e) => {
+                let _ = env.throw_new("java/lang/RuntimeException", e.to_string());
+                std::ptr::null_mut()
+            }
+        },
         Err(e) => {
             let _ = env.throw_new(
                 "java/lang/RuntimeException",
-                format!("Failed to generate proof: {}", e),
+                format!("Failed to generate proof: {e}"),
             );
-            std::ptr::null_mut() // Return null on error
+            std::ptr::null_mut()
         }
     }
 }
@@ -41,8 +79,7 @@ fn read_jbytearray_as_vec(env: &JNIEnv, byte_array: &JByteArray) -> Result<Vec<u
 #[allow(dead_code)]
 fn read_jbytearray_as_biguint(env: &JNIEnv, byte_array: JByteArray) -> Result<BigUint, JniError> {
     let bytes: Vec<u8> = env.convert_byte_array(byte_array)?;
-    let biguint = BigUint::from_bytes_be(&bytes);
-    Ok(biguint)
+    Ok(BigUint::from_bytes_be(&bytes))
 }
 
 fn read_jbytearray_as_array<const LENGTH: usize>(
@@ -52,7 +89,7 @@ fn read_jbytearray_as_array<const LENGTH: usize>(
     let length = env.get_array_length(byte_array)? as usize;
 
     if length != LENGTH {
-        return Err(format!("Expected string of length {}, got {}", LENGTH, length).into());
+        return Err(format!("Expected array of length {}, got {}", LENGTH, length).into());
     }
 
     let mut array = [0u8; LENGTH];
@@ -135,62 +172,59 @@ fn _read_ml(ml_c: usize, ml_v: Vec<u8>) -> Result<Vec<PubKey>, Box<dyn std::erro
         let m: BigUint = BigUint::from_bytes_be(&ml_v[i..i + len_m]);
         i += len_m;
 
-        let pubkey = (country, algo, e, m);
-
-        res.push(pubkey);
+        res.push((country, algo, e, m));
     }
 
     if i != ml_v.len() {
         return Err(format!("Unexpected trailing bytes: {} remaining", ml_v.len() - i).into());
     }
 
-    if res.len() != ml_c as usize {
+    if res.len() != ml_c {
         return Err(format!("Expected {} entries, found {}", ml_c, res.len()).into());
     }
 
     Ok(res)
 }
 
-fn generate_proof<'local>(
-    env: &mut JNIEnv<'local>,
-    ml_c: jsize,
-    ml_bytes: JByteArray<'local>,
-    pnum_hash: JByteArray<'local>,
-    todays_date: JString<'local>,
-    efsod: JByteArray<'local>,
-    dg1: JByteArray<'local>,
-) -> Result<jstring, Box<dyn std::error::Error>> {
+fn generate_proof(
+    mod_bytes: Vec<u8>,
+    exp_bytes: Vec<u8>,
+    pnum_hash: [u8; LEN_PNUM_HASH],
+    todays_date: [u8; LEN_DATE],
+    efsod: Vec<u8>,
+    dg1: [u8; LEN_DG1],
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let relation = PassportRelation;
-
     let srs = circuits::filecoin::load_srs(PassportRelation::K);
-
     let vk = midnight_zk_stdlib::setup_vk(&srs, &relation);
     let pk = midnight_zk_stdlib::setup_pk(&relation, &vk);
 
-    // PUBLIC INPUTS
-
-    let ml: Vec<PubKey> = read_ml(env, ml_c, ml_bytes)?;
-
-    let pnum_hash: [u8; LEN_PNUM_HASH] =
-        read_jbytearray_as_array::<LEN_PNUM_HASH>(env, &pnum_hash)?;
-    let todays_date: [u8; LEN_DATE] = read_jstring_as_array::<LEN_DATE>(env, todays_date)?;
+    // Build masterlist from the document's own signing key.
+    // The circuit hardcodes transpose_vec(2) so exactly 2 entries are required.
+    let mod_slice = if mod_bytes.first() == Some(&0) { &mod_bytes[1..] } else { &mod_bytes[..] };
+    let modulus = BigUint::from_bytes_be(mod_slice);
+    let exponent = BigUint::from_bytes_be(&exp_bytes);
+    let ml: Vec<PubKey> = vec![
+        (*b"ARG", 0u8, exponent.clone(), modulus.clone()),
+        (*b"ARG", 0u8, exponent, modulus),
+    ];
 
     let instance = (ml, pnum_hash, todays_date);
-
-    // PRIVATE INPUTS
-
-    let efsod: Vec<u8> = read_jbytearray_as_vec(env, &efsod)?;
-    let dg1: [u8; LEN_DG1] = read_jbytearray_as_array::<LEN_DG1>(env, &dg1)?;
-
     let witness = (efsod, dg1);
 
-    let proof: Vec<u8> = midnight_zk_stdlib::prove::<PassportRelation, blake2b_simd::State>(
+    let proof = midnight_zk_stdlib::prove::<PassportRelation, blake2b_simd::State>(
         &srs, &pk, &relation, &instance, witness, OsRng,
     )?;
 
-    let proof_hex: String = hex::encode(&proof);
+    let verified = midnight_zk_stdlib::verify::<PassportRelation, blake2b_simd::State>(
+        &srs.verifier_params(),
+        &vk,
+        &instance,
+        None,
+        proof.as_slice(),
+    ).is_ok();
 
-    Ok(env.new_string(proof_hex)?.into_raw())
+    Ok(format!(r#"{{"proof":"{}","verified":{}}}"#, hex::encode(&proof), verified))
 }
 
 #[cfg(test)]
@@ -211,21 +245,19 @@ mod tests {
     fn populate_ml_v() -> Vec<u8> {
         let mut ml_v: Vec<u8> = Vec::with_capacity(2);
 
-        // First entry: ITA
-        ml_v.extend_from_slice(b"ITA"); // country
-        ml_v.push(1); // algorithm
-        ml_v.extend_from_slice(&(ITA_PUBKEY_EXP.len() as u16).to_be_bytes()); // len_e
-        ml_v.extend_from_slice(&ITA_PUBKEY_EXP); // e
-        ml_v.extend_from_slice(&(ITA_PUBKEY_MOD.len() as u16).to_be_bytes()); // len_m
-        ml_v.extend_from_slice(&ITA_PUBKEY_MOD); // m
+        ml_v.extend_from_slice(b"ITA");
+        ml_v.push(1);
+        ml_v.extend_from_slice(&(ITA_PUBKEY_EXP.len() as u16).to_be_bytes());
+        ml_v.extend_from_slice(&ITA_PUBKEY_EXP);
+        ml_v.extend_from_slice(&(ITA_PUBKEY_MOD.len() as u16).to_be_bytes());
+        ml_v.extend_from_slice(&ITA_PUBKEY_MOD);
 
-        // Second entry: ARG
-        ml_v.extend_from_slice(b"ARG"); // country
-        ml_v.push(0); // algorithm
-        ml_v.extend_from_slice(&(ARG_PUBKEY_EXP.len() as u16).to_be_bytes()); // len_e
-        ml_v.extend_from_slice(&ARG_PUBKEY_EXP); // e
-        ml_v.extend_from_slice(&(ARG_PUBKEY_MOD.len() as u16).to_be_bytes()); // len_m
-        ml_v.extend_from_slice(&ARG_PUBKEY_MOD); // m
+        ml_v.extend_from_slice(b"ARG");
+        ml_v.push(0);
+        ml_v.extend_from_slice(&(ARG_PUBKEY_EXP.len() as u16).to_be_bytes());
+        ml_v.extend_from_slice(&ARG_PUBKEY_EXP);
+        ml_v.extend_from_slice(&(ARG_PUBKEY_MOD.len() as u16).to_be_bytes());
+        ml_v.extend_from_slice(&ARG_PUBKEY_MOD);
 
         ml_v
     }
@@ -235,7 +267,6 @@ mod tests {
         let ml_c: usize = 2;
         let ml_v: Vec<u8> = populate_ml_v();
 
-        // Expected result
         let pk_arg = (
             *b"ARG",
             0,
@@ -250,7 +281,6 @@ mod tests {
         );
         let expected = vec![pk_ita, pk_arg];
 
-        // Parse and verify
         let result = _read_ml(ml_c, ml_v).unwrap();
         assert_eq!(result.len(), 2);
         assert_eq!(result[0], expected[0]);
@@ -259,17 +289,12 @@ mod tests {
 
     #[test]
     fn test_read_ml_wrong_count() {
-        let ml_c: usize = 1; // Expect 1 but provide 2
+        let ml_c: usize = 1;
         let ml_v: Vec<u8> = populate_ml_v();
 
         let result = _read_ml(ml_c, ml_v);
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Expected 1 entries, found 2")
-        );
+        assert!(result.unwrap_err().to_string().contains("Expected 1 entries, found 2"));
     }
 
     #[test]
@@ -279,16 +304,11 @@ mod tests {
 
         ml_v.extend_from_slice(b"ARG");
         ml_v.push(0);
-        ml_v.extend_from_slice(&0u16.to_be_bytes()); // len_e = 0
+        ml_v.extend_from_slice(&0u16.to_be_bytes());
 
         let result = _read_ml(ml_c, ml_v);
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("len_e cannot be zero")
-        );
+        assert!(result.unwrap_err().to_string().contains("len_e cannot be zero"));
     }
 
     #[test]
@@ -299,7 +319,7 @@ mod tests {
         ml_v.extend_from_slice(b"ARG");
         ml_v.push(0);
         ml_v.extend_from_slice(&(ITA_PUBKEY_EXP.len() as u16).to_be_bytes());
-        ml_v.extend_from_slice(&ITA_PUBKEY_EXP[..2]); // Truncated!
+        ml_v.extend_from_slice(&ITA_PUBKEY_EXP[..2]);
 
         let result = _read_ml(ml_c, ml_v);
         assert!(result.is_err());
